@@ -1,121 +1,194 @@
 // server.js
-const express = require("express");
-const fetch = require("node-fetch");
-const cors = require("cors");
-const multer = require("multer");
-const mammoth = require("mammoth");
-const fs = require("fs");
-const path = require("path");
+// EDU AI Lab backend with Gemini 2.5 Pro
+
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import pdf from 'pdf-parse';
+import mammoth from 'mammoth';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const PORT = process.env.PORT || 3000;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyAO9M4xYP1I4dz-2ik-xgKk6sKpDkbZl_U';
+if (!GEMINI_API_KEY) {
+  console.error('❌ Missing GEMINI_API_KEY in environment.');
+  process.exit(1);
+}
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: '2mb' }));
 
-// 🔑 Gemini API key
-const GEMINI_API_KEY = "AIzaSyCwSIJA62axl23pdvoVrZBiesZ7HRRwHRQ";
+// Gemini init (using 2.5 Pro)
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro' });
 
-// Helper: Call Gemini
-async function askGemini(prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${GEMINI_API_KEY}`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }]
-    })
+// Helper to send prompt to Gemini
+async function askGemini(prompt, temperature = 0.7) {
+  const res = await model.generateContent({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature },
   });
-
-  const data = await resp.json();
-  if (!resp.ok) {
-    throw new Error(data?.error?.message || "Gemini API request failed");
-  }
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+  const out = res?.response?.text?.() || '';
+  return out.trim();
 }
 
-// --- TEXT-ONLY Summarizer ---
-app.post("/summarize-text", async (req, res) => {
-  try {
-    const { text } = req.body || {};
-    if (!text) return res.status(400).json({ error: "Missing text" });
-    const prompt = `Summarize the following content in about 300 words and then list EXACTLY 5 key points:\n\n${text}`;
-    const summary = await askGemini(prompt);
-    res.json({ summary });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+// Build prompts
+function buildLongSummaryPrompt(text, lang = 'English') {
+  return `
+You are an academic summarizer. Create a **deep, structured, and readable** summary in ${lang}.
+Follow this exact layout:
 
-// --- TEXT-ONLY Quiz Generator ---
-app.post("/quiz-text", async (req, res) => {
-  try {
-    const { text } = req.body || {};
-    if (!text) return res.status(400).json({ error: "Missing text" });
-    const prompt = `From the following content, create a set of 10 multiple-choice questions (MCQs) with 4 options each and mark the correct option:\n\n${text}`;
-    const quiz = await askGemini(prompt);
-    res.json({ quiz });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+Title: (infer if missing)
+Executive Summary (6–10 sentences)
+Key Concepts (bulleted)
+Step-by-Step Explanation (8–14 steps)
+Examples & Analogies
+Important Data/Formulae
+Assumptions & Limitations
+Implications & Applications
+Common Pitfalls / Misconceptions
+🎯 10 High-Impact Takeaways
 
-// --- File upload setup ---
-const upload = multer({ dest: "uploads/" });
+Now summarize this source content:
 
-async function extractText(filePath, mimetype) {
-  const ext = path.extname(filePath).toLowerCase();
-  if (mimetype === "application/pdf" || ext === ".pdf") {
-    const pdfParse = require("pdf-parse"); // require here to avoid startup load
-    const buf = fs.readFileSync(filePath);
-    const parsed = await pdfParse(buf);
-    return parsed.text || "";
-  }
-  if (
-    mimetype ===
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-    ext === ".docx"
-  ) {
-    const buf = fs.readFileSync(filePath);
-    const result = await mammoth.extractRawText({ buffer: buf });
-    return result.value || "";
-  }
-  // Fallback to plain text
-  return fs.readFileSync(filePath, "utf8");
+${text}
+`;
 }
 
-// --- FILE Summarizer ---
-app.post("/summarize-file", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const text = await extractText(req.file.path, req.file.mimetype);
-    fs.unlink(req.file.path, () => {}); // cleanup
+function buildQuizPrompt(text, count = 10) {
+  return `
+Create ${count} multiple-choice questions from the content below.
+- 4 options (A–D), only one correct.
+- Show "Answer: <Letter> — reason".
 
-    const prompt = `Summarize the following content in about 300 words and then list EXACTLY 5 key points:\n\n${text}`;
-    const summary = await askGemini(prompt);
+${text}
+`;
+}
+
+function buildFlashcardsPrompt(text, count = 20) {
+  return `
+Generate ${count} active-recall flashcards.
+Q: <question>
+A: <answer>
+
+CONTENT:
+${text}
+`;
+}
+
+function buildMindmapPrompt(topicOrText) {
+  return `
+Convert into a Mermaid mind map.
+Return ONLY Mermaid code starting with "mindmap".
+
+${topicOrText}
+`;
+}
+
+function buildMotivationPrompt(context) {
+  return `
+Give a 150-word motivational note for exam prep.
+Include one actionable tip.
+Context: ${context || 'N/A'}
+`;
+}
+
+function buildBilingualWrap(answer, targetLanguage) {
+  if (!targetLanguage || targetLanguage.toLowerCase() === 'none') return answer;
+  return `${answer}\n\n---\n\n🔁 ${targetLanguage} Translation:\nPlease translate the entire answer above into ${targetLanguage}.`;
+}
+
+// ===== Routes =====
+
+// Generic ask endpoint
+app.post('/ask', async (req, res) => {
+  try {
+    const { question, mode, language } = req.body || {};
+    let prompt = '';
+
+    if (mode === 'summary') prompt = buildLongSummaryPrompt(question, 'English');
+    else if (mode === 'quiz') prompt = buildQuizPrompt(question, 10);
+    else if (mode === 'flashcards') prompt = buildFlashcardsPrompt(question, 24);
+    else if (mode === 'mindmap') prompt = buildMindmapPrompt(question);
+    else if (mode === 'motivation') prompt = buildMotivationPrompt(question);
+    else prompt = question || '';
+
+    let ai = await askGemini(prompt, 0.7);
+    ai = buildBilingualWrap(ai, language);
+
+    res.json({ answer: ai });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'ask_failed', details: String(err) });
+  }
+});
+
+// Study plan endpoint
+app.post('/plan', async (req, res) => {
+  try {
+    const { subjects = [], examDate, hoursPerDay = 2, language } = req.body || {};
+    const prompt = `
+Create a day-by-day study plan until ${examDate}.
+Subjects: ${subjects.join(', ') || 'N/A'}
+Hours/Day: ${hoursPerDay}
+Include weekly reviews, spaced repetition, and 3 exam week tips.
+`;
+
+    let ai = await askGemini(prompt, 0.5);
+    ai = buildBilingualWrap(ai, language);
+    res.json({ plan: ai });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'plan_failed', details: String(err) });
+  }
+});
+
+// File upload summarizer
+const upload = multer({
+  dest: path.join(__dirname, 'uploads'),
+  limits: { fileSize: 12 * 1024 * 1024 },
+});
+
+async function readTxt(fp) { return fs.promises.readFile(fp, 'utf-8'); }
+async function readPdf(fp) { const data = await pdf(await fs.promises.readFile(fp)); return data.text || ''; }
+async function readDocx(fp) { const res = await mammoth.extractRawText({ path: fp }); return res.value || ''; }
+
+app.post('/upload', upload.single('file'), async (req, res) => {
+  const f = req.file;
+  if (!f) return res.status(400).json({ error: 'no_file' });
+
+  try {
+    let text = '';
+    const ext = (f.originalname.split('.').pop() || '').toLowerCase();
+    if (ext === 'pdf') text = await readPdf(f.path);
+    else if (ext === 'docx') text = await readDocx(f.path);
+    else if (ext === 'txt') text = await readTxt(f.path);
+    else return res.status(400).json({ error: 'unsupported_type' });
+
+    if (!text.trim()) return res.status(400).json({ error: 'empty_file' });
+
+    const prompt = buildLongSummaryPrompt(text, 'English');
+    let summary = await askGemini(prompt, 0.4);
+    summary = buildBilingualWrap(summary, req.body?.language);
+
     res.json({ summary });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'upload_failed', details: String(err) });
+  } finally {
+    try { fs.unlinkSync(req.file.path); } catch {}
   }
 });
 
-// --- FILE Quiz Generator ---
-app.post("/quiz-file", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const text = await extractText(req.file.path, req.file.mimetype);
-    fs.unlink(req.file.path, () => {}); // cleanup
+// Health check
+app.get('/', (_req, res) => res.send('✅ EDU AI Lab backend is running (Gemini 2.5 Pro)'));
 
-    const prompt = `From the following content, create a set of 10 multiple-choice questions (MCQs) with 4 options each and mark the correct option:\n\n${text}`;
-    const quiz = await askGemini(prompt);
-    res.json({ quiz });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// --- Root Endpoint ---
-app.get("/", (req, res) => {
-  res.send("📚 Gemini AI server is live! Endpoints: /summarize-text, /quiz-text, /summarize-file, /quiz-file");
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
